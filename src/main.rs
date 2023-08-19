@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 
-use epoll::{Event, Events, ControlOptions::*};
+use epoll::{ControlOptions::*, Event, Events};
 
 enum ConnectionState {
     Read {
-        request: Vec<u8>,
+        request: [u8; 1024],
         read: usize,
     },
     Write {
@@ -24,65 +25,91 @@ fn main() {
 
     let event = Event::new(Events::EPOLLIN, listener.as_raw_fd() as _);
     epoll::ctl(epoll, EPOLL_CTL_ADD, listener.as_raw_fd(), event).unwrap();
-    let mut conn_vec = Vec::new();
+    let mut conn_map = HashMap::new();
 
     loop {
-        match listener.accept() {
-            Ok((conn, _)) => {
-                conn.set_nonblocking(true).unwrap();
-
-                // kep track of connection state
-                let state = ConnectionState::Read {
-                    request: Vec::new(),
-                    read: 0,
-                };
-
-                conn_vec.push((conn, state));
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => panic!("{e}"),
-        };
-
+        let mut events = [Event::new(Events::empty(), 0); 1024];
+        let timeout = -1; // block until something happens
+        let num_events = epoll::wait(epoll, timeout, &mut events).unwrap();
         let mut completed = Vec::new();
 
-        'next: for (i, (conn, state)) in conn_vec.iter_mut().enumerate() {
+        'next: for event in &events[..num_events] {
+            let fd = event.data as i32;
+            println!("the fd is {}", fd);
+
+            if fd == listener.as_raw_fd() {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        conn.set_nonblocking(true).unwrap();
+                        let fd = conn.as_raw_fd();
+
+                        // register the connection with epoll
+                        let event = Event::new(Events::EPOLLIN | Events::EPOLLOUT, fd as _);
+                        epoll::ctl(epoll, EPOLL_CTL_ADD, fd, event).unwrap();
+
+                        // kep track of connection state
+                        let state = ConnectionState::Read {
+                            request: [0u8; 1024],
+                            read: 0,
+                        };
+
+                        conn_map.insert(fd, (conn, state));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("{e}"),
+                };
+
+                println!("listhener fd is {}", listener.as_raw_fd());
+                continue 'next;
+            }
+
+            let (conn, state) = conn_map.get_mut(&fd).unwrap();
+
             if let ConnectionState::Read { request, read } = state {
                 loop {
                     // try reading
                     match conn.read(&mut request[*read..]) {
                         Ok(0) => {
-                            println!("client disconnected unexpectedly");
-                            completed.push(i);
+                            println!("client disconnected unexpectedly becuase 0 bytes is read");
+                            completed.push(fd);
+                            continue 'next;
                         }
                         Ok(n) => *read += n,
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue 'next,
                         Err(e) => panic!("{e}"),
                     }
-                }
-            }
 
-            if let ConnectionState::Write { response, written } = state {
+                    if request.get(*read - 4..*read) == Some(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
                 // Hello world
-                *response = concat!(
+                let response = concat!(
                     "HTTP/1.1 200 OK\r\n",
                     "Content-Length:12\n",
                     "Connection: close\r\n\r\n",
                     "Hello World!"
                 )
                 .as_bytes();
+                *state = ConnectionState::Write {
+                    response,
+                    written: 0,
+                };
+            }
 
+            if let ConnectionState::Write { response, written } = state {
                 loop {
                     // write response bytes
                     match conn.write(&response[*written..]) {
                         Ok(0) => {
                             println!("client disconnected unexpectedly");
-                            completed.push(i);
+                            completed.push(fd);
                             continue 'next;
                         }
                         Ok(n) => *written += n,
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue 'next,
                         Err(e) => panic!("{e}"),
-
                     }
 
                     if *written == response.len() {
@@ -96,29 +123,20 @@ fn main() {
             if let ConnectionState::Flush = state {
                 match conn.flush() {
                     Ok(_) => {
-                        completed.push(i);
+                        completed.push(fd);
+                        conn.flush().unwrap();
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue 'next,
                     Err(e) => panic!("{e}"),
-
                 }
-                //conn.flush().unwrap();
-
-                //completed.push(i);
             }
-
         }
 
         // remove completed connection
-        for i in completed.iter().rev() {
-            conn_vec.remove(*i);
+        for fd in completed.iter().rev() {
+            let (conn, _state) = conn_map.remove(&fd).unwrap();
+            drop(conn);
         }
-
-        //std::thread::spawn(|| {
-        //    if let Err(e) = handle_connection(connection) {
-        //        println!("failed to handle connection: {e:?}");
-        //    }
-        //});
     }
 }
 
