@@ -35,7 +35,6 @@ fn main() {
 
         'next: for event in &events[..num_events] {
             let fd = event.data as i32;
-            println!("the fd is {}", fd);
 
             if fd == listener.as_raw_fd() {
                 match listener.accept() {
@@ -59,7 +58,6 @@ fn main() {
                     Err(e) => panic!("{e}"),
                 };
 
-                println!("listhener fd is {}", listener.as_raw_fd());
                 continue 'next;
             }
 
